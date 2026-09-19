@@ -1,0 +1,53 @@
+name: publish-release
+
+# 触发：私有仓库（TsSnakeTang/AIwriter_MiniMax）CI 经 deploy key 推送 `latest` 分支，
+#   分支携带 release-meta.json + 三个产物（安装包 / .sig / latest.json）。
+# 职责：把这些文件变成对应 tag 的 GitHub Release（--latest），供客户端匿名拉取。
+# 幂等：Release 已存在则 clobber 上传 + 重新置 latest；不存在则创建。
+on:
+  push:
+    branches:
+      - latest
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Create/Update GitHub Release from staged files
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Publish release (idempotent)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "── release-meta.json ──"
+          cat release-meta.json
+          TAG="$(jq -r .tag release-meta.json)"
+          TITLE="$(jq -r .title release-meta.json)"
+          mapfile -t ASSETS < <(jq -r '.assets[]' release-meta.json)
+          echo "tag=$TAG title=$TITLE assets=${ASSETS[*]}"
+          for f in "${ASSETS[@]}"; do
+            test -f "$f" || { echo "MISSING STAGED FILE: $f"; exit 1; }
+          done
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在 → clobber 上传"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            gh release edit "$TAG" --latest
+          else
+            echo "创建 release $TAG"
+            gh release create "$TAG" --latest \
+              --title "$TITLE" --notes-file release-notes.md "${ASSETS[@]}"
+          fi
+
+          echo "── 复核 ──"
+          gh release view "$TAG" --json tagName,isLatest,isDraft,isPrerelease,url,assets \
+            --jq '{tag:.tagName,latest:.isLatest,draft:.isDraft,prerelease:.isPrerelease,url:.url,assets:[.assets[]|{name,size}]}'
