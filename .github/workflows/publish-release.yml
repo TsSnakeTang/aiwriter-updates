@@ -49,5 +49,10 @@ jobs:
           fi
 
           echo "── 复核 ──"
-          gh release view "$TAG" --json tagName,isLatest,isDraft,isPrerelease,url,assets \
-            --jq '{tag:.tagName,latest:.isLatest,draft:.isDraft,prerelease:.isPrerelease,url:.url,assets:[.assets[]|{name,size}]}'
+          # 注意：gh release view --json 无 isLatest 字段（不同 gh 版本字段集不同，实测报
+          # 「Unknown JSON field」把复核步骤打红）；latest 归属用 REST /releases/latest 判。
+          gh release view "$TAG" --json tagName,isDraft,isPrerelease,url,assets \
+            --jq '{tag:.tagName,draft:.isDraft,prerelease:.isPrerelease,url:.url,assets:[.assets[]|{name,size}]}'
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
+          echo "/releases/latest → $LATEST（本次 $TAG）"
+          [ "$LATEST" = "$TAG" ] || echo "::warning::/releases/latest 指向 $LATEST，非本次 $TAG"
