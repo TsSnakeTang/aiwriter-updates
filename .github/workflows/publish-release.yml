@@ -4,6 +4,20 @@ name: publish-release
 #   分支携带 release-meta.json + 三个产物（安装包 / .sig / latest.json）。
 # 职责：把这些文件变成对应 tag 的 GitHub Release（--latest），供客户端匿名拉取。
 # 幂等：Release 已存在则 clobber 上传 + 重新置 latest；不存在则创建。
+#
+# ── 2026-10-21 t_8ef9d9d0 两处修复（都是真实事故，不是理论风险） ────────────────
+#  ①「已存在但仍是 draft」：run 39563726794（v0.1.32）跑到时 Release 仍是 draft，
+#     `gh release edit --latest` 被 HTTP 422 拒绝
+#     （"Latest release cannot be draft or prerelease"）→ job 红，而 Release 保持 draft。
+#     旧实现把这条路径当「已存在 → clobber 上传」处理，既没先转正也没把 422 当硬失败。
+#     现在：探到 draft ⇒ 先 REST PATCH `draft=false` + `make_latest=true` 转正，再上传；
+#     转正失败 ⇒ 立即 exit 1（硬失败，不再往下走）。
+#  ②「发布之后凭空消失」：同日 v0.1.32 的 Release 在 15:56:37（三资产 uploaded）与
+#     15:58:45（同端点 404）之间消失，`/releases/latest` 回落到 v0.1.31，客户端端点
+#     清单同回落 —— 而当时的 job 早已成功结束，没有任何门会再读一次。
+#     现在：发布后加「发布态存活复核」步骤 —— 首读指纹（tag/draft/assets digest +
+#     `/releases/latest`），等 LIVENESS_WAIT 秒（默认 300）再复读，逐字段比对；
+#     对象消失或任一字段漂移 ⇒ job 红，并把两次读数打进日志。
 on:
   push:
     branches:
@@ -38,21 +52,100 @@ jobs:
             test -f "$f" || { echo "MISSING STAGED FILE: $f"; exit 1; }
           done
 
+          REL="repos/$GITHUB_REPOSITORY/releases"
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG 已存在 → clobber 上传"
+            RID="$(gh api "$REL/tags/$TAG" --jq '.id')"
+            DRAFT="$(gh api "$REL/tags/$TAG" --jq '.draft')"
+            echo "release $TAG 已存在（id=$RID draft=$DRAFT）"
+            if [ "$DRAFT" = "true" ]; then
+              # 必须先转正：draft 状态下 `gh release edit --latest` 必定 422。
+              # -F = 类型化字段（draft 是布尔）；make_latest 在 REST 里是字符串枚举。
+              echo "→ Release 仍是 draft：先 PATCH 转正 + 置 latest，再上传"
+              if ! gh api -X PATCH "$REL/$RID" -F draft=false -f make_latest=true >/dev/null; then
+                echo "::error::draft Release $TAG 转正失败（PATCH draft=false 被拒）—— 硬失败，不再上传"
+                exit 1
+              fi
+              echo "  转正后 draft=$(gh api "$REL/$RID" --jq '.draft')"
+            fi
+            echo "clobber 上传 ${ASSETS[*]}"
             gh release upload "$TAG" "${ASSETS[@]}" --clobber
-            gh release edit "$TAG" --latest
+            # 上传后重新置 latest（REST 口径，幂等；gh release edit --latest 同义但会多一层 gh 版本行为）
+            gh api -X PATCH "$REL/$RID" -f make_latest=true >/dev/null
           else
             echo "创建 release $TAG"
             gh release create "$TAG" --latest \
               --title "$TITLE" --notes-file release-notes.md "${ASSETS[@]}"
           fi
 
-          echo "── 复核 ──"
+          echo "── 复核（即时）──"
           # 注意：gh release view --json 无 isLatest 字段（不同 gh 版本字段集不同，实测报
           # 「Unknown JSON field」把复核步骤打红）；latest 归属用 REST /releases/latest 判。
           gh release view "$TAG" --json tagName,isDraft,isPrerelease,url,assets \
             --jq '{tag:.tagName,draft:.isDraft,prerelease:.isPrerelease,url:.url,assets:[.assets[]|{name,size}]}'
+          # 「即时复核」必须是硬失败：旧实现只 `::warning::`，于是 draft/未置 latest 都能绿。
           LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
           echo "/releases/latest → $LATEST（本次 $TAG）"
-          [ "$LATEST" = "$TAG" ] || echo "::warning::/releases/latest 指向 $LATEST，非本次 $TAG"
+          if [ "$LATEST" != "$TAG" ]; then
+            echo "::error::/releases/latest 指向 $LATEST，不是本次 $TAG —— 发布态不正确"
+            exit 1
+          fi
+
+      # 发布态存活复核（延迟复读）：见文件头 ②。默认等 300s，最长不超过 job timeout。
+      - name: Release liveness re-check (delayed)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIVENESS_WAIT: ${{ vars.RELEASE_LIVENESS_WAIT || '300' }}
+        run: |
+          set -euo pipefail
+          TAG="$(jq -r .tag release-meta.json)"
+          REL="repos/$GITHUB_REPOSITORY/releases"
+          ASSETS="$(jq -r '.assets|join(" ")' release-meta.json)"
+
+          fingerprint() { # → 稳定字符串（tag|draft|asset:size:digest ...|latest）
+            local j
+            if ! j="$(gh api "$REL/tags/$TAG" 2>/dev/null)"; then
+              echo "RELEASE_GONE"
+              return 0
+            fi
+            {
+              echo "tag=$(echo "$j" | jq -r .tag_name)"
+              echo "draft=$(echo "$j" | jq -r .draft)"
+              # 只对 release-meta 声明的资产取 size+digest，顺序固定 ⇒ 可逐字比较
+              for a in $ASSETS; do
+                line="$(echo "$j" | jq -r --arg n "$a" \
+                  '.assets[]? | select(.name==$n) | "asset:\($n):\(.size):\(.digest // "nodigest"):\(.state)"')"
+                if [ -z "$line" ]; then echo "asset:$a:MISSING"; else echo "$line"; fi
+              done
+              echo "latest=$(gh api "$REL/latest" --jq '.tag_name' 2>/dev/null || echo NONE)"
+            } | sort
+          }
+
+          A="$(fingerprint)"
+          echo "── 首读指纹 ──"; printf '%s\n' "$A"
+          if printf '%s\n' "$A" | grep -q RELEASE_GONE; then
+            echo "::error::首读就拿不到 Release $TAG"; exit 1
+          fi
+          if printf '%s\n' "$A" | grep -q 'MISSING'; then
+            echo "::error::首读缺资产（release-meta 声明的资产没传全）"; exit 1
+          fi
+          if ! printf '%s\n' "$A" | grep -qx "latest=$TAG"; then
+            echo "::error::首读 /releases/latest != $TAG"; exit 1
+          fi
+
+          echo "等待 ${LIVENESS_WAIT}s 后复读（发布态存活窗口）…"
+          sleep "${LIVENESS_WAIT}"
+          B="$(fingerprint)"
+          echo "── 复读指纹 ──"; printf '%s\n' "$B"
+
+          if printf '%s\n' "$B" | grep -q RELEASE_GONE; then
+            echo "::error::发布后 ${LIVENESS_WAIT}s 内 Release $TAG 已消失（首读存在 → 复读 404）"
+            exit 1
+          fi
+          if [ "$A" != "$B" ]; then
+            echo "::error::发布态漂移（两次指纹不一致）"
+            diff <(printf '%s\n' "$A") <(printf '%s\n' "$B") || true
+            exit 1
+          fi
+          echo "✅ 发布态存活复核通过（${LIVENESS_WAIT}s 内 tag/资产 digest/latest 均未变）"
