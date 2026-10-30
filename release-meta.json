@@ -1,0 +1,10 @@
+{
+  "tag": "v0.1.39",
+  "version": "0.1.39",
+  "title": "AIwriter MiniMax 桌面版 v0.1.39",
+  "assets": [
+    "AIwriter.MiniMax_0.1.39_x64-setup.exe",
+    "AIwriter.MiniMax_0.1.39_x64-setup.exe.sig",
+    "latest.json"
+  ]
+}
